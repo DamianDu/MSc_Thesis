@@ -9,6 +9,7 @@ import pandas as pd
 
 # ============================================================
 # SETTINGS
+# Main paths, constants, calibration factors and analysis thresholds.
 # ============================================================
 INPUT_DIR = Path("btc_background_corrected")
 OUTPUT_CSV = Path("BTC_mastertable_corrected.csv")
@@ -79,6 +80,12 @@ FILENAME_PATTERN = re.compile(
 
 
 def read_csv_auto(path: Path) -> pd.DataFrame:
+    """
+    Read one CSV file and automatically detect the separator.
+
+    The column names are cleaned afterwards so that hidden UTF-8
+    characters or spaces do not cause problems later in the analysis.
+    """
     df = pd.read_csv(path, sep=None, engine="python", encoding="utf-8-sig")
     df.columns = (
         df.columns.astype(str).str.strip().str.replace("\ufeff", "", regex=False)
@@ -87,6 +94,13 @@ def read_csv_auto(path: Path) -> pd.DataFrame:
 
 
 def robust_sigma(values: np.ndarray) -> float:
+    """
+    Estimate the background noise of the signal.
+
+    The median absolute deviation (MAD) is used first because it is
+    less sensitive to single outliers than the normal standard deviation.
+    If this does not give a useful value, the standard deviation is used.
+    """
     values = np.asarray(values, dtype=float)
     values = values[np.isfinite(values)]
     if len(values) < 2:
@@ -100,10 +114,22 @@ def robust_sigma(values: np.ndarray) -> float:
 
 
 def trapz(y: np.ndarray, x: np.ndarray) -> float:
+    """
+    Calculate the area under a curve with trapezoidal integration.
+
+    The fallback to np.trapz keeps the script compatible with older
+    NumPy versions.
+    """
     return float(np.trapezoid(y, x) if hasattr(np, "trapezoid") else np.trapz(y, x))
 
 
 def parse_filename(path: Path) -> dict:
+    """
+    Read the stream, device number and injection number from the file name.
+
+    This allows the script to assign the correct stream and monitoring
+    station automatically without entering this information manually.
+    """
     m = FILENAME_PATTERN.match(path.name)
     if m is None:
         raise ValueError(f"Unexpected filename: {path.name}")
@@ -121,6 +147,12 @@ def parse_filename(path: Path) -> dict:
 
 
 def choose_clean_column(df: pd.DataFrame, path: Path) -> str:
+    """
+    Select the cleaned tracer-signal column from the input file.
+
+    Some files contain the manually cleaned signal and others the
+    automatically cleaned signal. The first available option is used.
+    """
     for col in CLEAN_COLUMN_CANDIDATES:
         if col in df.columns:
             return col
@@ -130,6 +162,13 @@ def choose_clean_column(df: pd.DataFrame, path: Path) -> str:
 
 
 def cumulative_quantile_time(t: np.ndarray, c: np.ndarray, q: float) -> float:
+    """
+    Calculate the time when a selected fraction of the total BTC area
+    has passed the monitoring station.
+
+    For example, q = 0.10 gives t10, q = 0.50 gives t50 and
+    q = 0.90 gives t90.
+    """
     if len(t) < 2:
         return np.nan
     seg = 0.5 * (c[:-1] + c[1:]) * np.diff(t)
@@ -141,12 +180,25 @@ def cumulative_quantile_time(t: np.ndarray, c: np.ndarray, q: float) -> float:
 
 
 def crossing(x1, y1, x2, y2, target) -> float:
+    """
+    Linearly interpolate the position where the signal crosses a target value.
+
+    This is mainly used to determine the two half-maximum crossing times
+    needed for the FWHM.
+    """
     if y2 == y1:
         return float(x1)
     return float(x1 + (target - y1) * (x2 - x1) / (y2 - y1))
 
 
 def calculate_fwhm(t: np.ndarray, c: np.ndarray) -> tuple[float, float, float]:
+    """
+    Calculate the full width at half maximum (FWHM) of the BTC.
+
+    The function finds the maximum concentration, calculates 50% of this
+    value and searches for the corresponding crossing before and after
+    the peak. The time difference between both crossings is the FWHM.
+    """
     peak = int(np.argmax(c))
     cmax = float(c[peak])
     if cmax <= 0:
@@ -167,6 +219,13 @@ def calculate_fwhm(t: np.ndarray, c: np.ndarray) -> tuple[float, float, float]:
 
 
 def calculate_moments(t: np.ndarray, c: np.ndarray) -> dict:
+    """
+    Calculate the main statistical moments of the BTC.
+
+    Concentration is used as weighting. The returned values include
+    total area, mean arrival time, temporal variance, standard deviation,
+    skewness and excess kurtosis.
+    """
     area = trapz(c, t)
     if not np.isfinite(area) or area <= 0:
         return dict(area=np.nan, mean=np.nan, variance=np.nan, std=np.nan,
@@ -186,6 +245,13 @@ def calculate_moments(t: np.ndarray, c: np.ndarray) -> dict:
 
 
 def calculate_tail_metrics(t: np.ndarray, c: np.ndarray) -> dict:
+    """
+    Calculate metrics describing the late-time tail of the BTC.
+
+    The tail starts at the first post-peak concentration below 10% of Cmax.
+    The function calculates the tail fraction and also fits an exponential
+    decay in logarithmic space to estimate a decay rate and timescale.
+    """
     peak = int(np.argmax(c))
     cmax = float(c[peak])
     total_area = trapz(c, t)
@@ -223,6 +289,13 @@ def calculate_tail_metrics(t: np.ndarray, c: np.ndarray) -> dict:
 
 
 def background_metrics(df: pd.DataFrame, signal: np.ndarray) -> dict:
+    """
+    Calculate background and noise information for one BTC.
+
+    If a manually defined baseline exists, the function stores the
+    background before and after the BTC and calculates the background drift.
+    Noise is estimated from the parts of the signal before and after the BTC.
+    """
     out = dict(background_before_mV=np.nan, background_after_mV=np.nan,
                background_drift_mV=np.nan, noise_before_mV=np.nan,
                noise_after_mV=np.nan)
@@ -243,16 +316,36 @@ def background_metrics(df: pd.DataFrame, signal: np.ndarray) -> dict:
 
 
 def make_uiid(stream_id: int, injection: int, device: int) -> int:
+    """
+    Create one numeric ID for every BTC from stream, injection and device.
+
+    The ID is only used to make every BTC uniquely identifiable in the
+    final master table.
+    """
     return stream_id * 10000 + injection * 100 + device % 100
 
 
 def analyse_file(path: Path) -> dict:
+    """
+    Analyse one cleaned BTC file and return all calculated values.
+
+    Main workflow:
+    1. Read stream and station information from the filename.
+    2. Load the cleaned BTC.
+    3. Convert the voltage signal to concentration.
+    4. Convert timestamps to seconds after injection.
+    5. Calculate BTC characteristics, tail metrics and velocities.
+    6. Perform simple automatic quality checks.
+    7. Return one summary row for the master table.
+    """
+    # Read stream, station and injection information from the file name.
     meta = parse_filename(path)
     stream_id = meta["stream_id"]
     stream = meta["stream"]
     device = meta["device"]
     injection = meta["injection"]
 
+    # Load the cleaned BTC data and select the correct signal column.
     df = read_csv_auto(path)
     clean_col = choose_clean_column(df, path)
     if TIME_COLUMN not in df.columns:
@@ -264,24 +357,30 @@ def analyse_file(path: Path) -> dict:
     if df.empty:
         raise ValueError(f"No valid data in {path.name}")
 
+    # Convert the cleaned voltage signal to concentration.
+    # Negative values after cleaning are set to zero.
     signal = df[clean_col].to_numpy(dtype=float, copy=True)
     signal[signal < 0] = 0.0
     factor, offset = CALIBRATION[device]
     concentration = signal * factor + offset
     concentration[concentration < 0] = 0.0
 
+    # Use the injection time to express the complete BTC on a common
+    # time axis in seconds after tracer injection.
     key = (stream_id, injection)
     if key not in INJECTION_TIMES_UTC:
         raise KeyError(f"No injection time configured for {key}")
     injection_time = pd.to_datetime(INJECTION_TIMES_UTC[key])
     t = (df[TIME_COLUMN] - injection_time).dt.total_seconds().to_numpy(float)
 
+    # Identify the first positive value, last positive value and BTC peak.
     positive = np.flatnonzero(concentration > 0)
     if len(positive) == 0:
         raise ValueError(f"No positive BTC values in {path.name}")
     first, last = int(positive[0]), int(positive[-1])
     peak = int(np.argmax(concentration))
 
+    # Calculate the main BTC characteristics used later in the thesis.
     moments = calculate_moments(t, concentration)
     t10 = cumulative_quantile_time(t, concentration, 0.10)
     t50 = cumulative_quantile_time(t, concentration, 0.50)
@@ -290,23 +389,29 @@ def analyse_file(path: Path) -> dict:
     tail = calculate_tail_metrics(t, concentration)
     bg = background_metrics(df, signal)
 
+    # Combine the available noise estimates and calculate a signal-to-noise ratio.
     noise_candidates = [bg["noise_before_mV"], bg["noise_after_mV"]]
     noise_candidates = [x for x in noise_candidates if np.isfinite(x) and x > 0]
     noise = float(np.median(noise_candidates)) if noise_candidates else np.nan
     peak_mV = float(signal[peak])
     snr = peak_mV / noise if np.isfinite(noise) and noise > 0 else np.nan
 
+    # Calculate characteristic transport velocities from station distance
+    # and different arrival-time measures.
     distance = DISTANCE_M.get((stream, device), np.nan)
     peak_velocity = distance / t[peak] if np.isfinite(distance) and t[peak] > 0 else np.nan
     mean_velocity = distance / moments["mean"] if np.isfinite(distance) and moments["mean"] > 0 else np.nan
     t50_velocity = distance / t50 if np.isfinite(distance) and t50 > 0 else np.nan
 
+    # Optional calculations of discharge and tracer recovery.
+    # These are only used if injected mass or reference discharge are provided.
     injected_mass = INJECTED_MASS_MG.get(key, np.nan)
     known_q = REFERENCE_DISCHARGE_M3_S.get(key, np.nan)
     q_est = injected_mass / moments["area"] / 1000.0 if np.isfinite(injected_mass) and moments["area"] > 0 else np.nan
     recovered_mass = known_q * 1000.0 * moments["area"] if np.isfinite(known_q) and moments["area"] > 0 else np.nan
     recovery = 100.0 * recovered_mass / injected_mass if np.isfinite(recovered_mass) and np.isfinite(injected_mass) and injected_mass > 0 else np.nan
 
+    # Collect automatic quality-control warnings for this BTC.
     reasons = []
     if len(positive) < MIN_POSITIVE_POINTS:
         reasons.append(f"fewer than {MIN_POSITIVE_POINTS} positive points")
@@ -317,6 +422,7 @@ def analyse_file(path: Path) -> dict:
     if not np.isfinite(fwhm):
         reasons.append("FWHM not available")
 
+    # Return all calculated information as one row for the master table.
     return {
         "uiid": make_uiid(stream_id, injection, device),
         "Stream_ID": stream_id,
@@ -373,14 +479,23 @@ def analyse_file(path: Path) -> dict:
     }
 
 
+# ============================================================
+# RUN ANALYSIS FOR ALL BTC FILES
+# ============================================================
+
+# Stop immediately if the expected input folder does not exist.
 if not INPUT_DIR.exists():
     raise FileNotFoundError(f"Input folder not found: {INPUT_DIR.resolve()}")
 
+# Find all recleaned BTC files in the input folder.
 files = sorted(INPUT_DIR.glob("*_LA_mV_recleaned.csv"))
 if not files:
     raise FileNotFoundError(f"No recleaned CSV files found in {INPUT_DIR.resolve()}")
 
+# Store successful results and possible processing errors separately.
 rows, errors = [], []
+# Analyse every BTC independently. If one file fails, the remaining
+# files are still processed.
 for path in files:
     try:
         rows.append(analyse_file(path))
@@ -392,13 +507,17 @@ for path in files:
 if not rows:
     raise RuntimeError("No BTC files could be processed.")
 
+# Combine all BTC summaries into one master table and sort them.
 master = pd.DataFrame(rows).sort_values(
     ["Stream_ID", "Injection", "Distance_m", "Device_number"],
     na_position="last",
 ).reset_index(drop=True)
 
+# Save the final master table as CSV.
 master.to_csv(OUTPUT_CSV, sep=";", index=False)
 
+# Also save the table as Excel. If some files caused errors,
+# they are written to an additional sheet.
 try:
     with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
         master.to_excel(writer, sheet_name="BTC_mastertable", index=False)
