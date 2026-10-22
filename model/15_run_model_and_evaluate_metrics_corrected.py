@@ -1,0 +1,1054 @@
+# -*- coding: utf-8 -*-
+"""
+Run the existing BTC transport model and calculate the evaluation metrics used
+in the thesis.
+
+The script imports the existing model file dynamically, runs the configured
+stream/injection combinations, and evaluates:
+
+1. Shape NRMSE
+2. Relative peak concentration/height error [%]
+3. Peak timing error [s]
+4. Tail RMSLE
+5. Relative tail area error [%]
+
+Tail start is defined as t90 of the OBSERVED BTC.
+
+Place this script in the same folder as:
+    13_model_new_corrected.py
+    BTC_mastertable.xlsx
+    btc_background_corrected/
+
+The existing model is NOT modified.
+"""
+
+#  libraires
+from pathlib import Path
+import importlib.util
+import json
+import time
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =============================================================================
+# USER SETTINGS
+# =============================================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Existing model script
+MODEL_SCRIPT = BASE_DIR / "13_model_new_corrected.py"
+
+# Mastertable generated for the evaluation of the measured BTCs
+MASTERFILE = Path.home() / "BTC_output" / "BTC_mastertable_simple.csv"
+
+# Cleaned BTC input files
+BTC_FOLDER = BASE_DIR / "btc_background_corrected"
+
+# Model evaluation outputs
+OUTPUT_ROOT = Path.home() / "BTC_output" / "Leitschachbach3_better_plot2"
+# Add/remove runs as needed.
+#
+# select the stream and injection for the analysis
+# it is possible to change the "storage_out_scale" and see how it changes the BTC 
+RUNS =  [
+    # gangbach, for a change in injection the number can be switch at "injection"
+#    {
+#        "stream": "Gangbach",
+#        "injection": 3,
+#        "relative_submerge": 1.66,
+#        "params": {
+#            "VELOCITY_SCALE": 0.87,
+#            "D_SCALE": 1.0,
+#            "D_ZONE_FACTORS": np.array([0.7, 1.0, 0.3], dtype=float),
+#            "STORAGE_IN_SCALE": 1.0,
+#            "STORAGE_OUT_SCALE": 0.04,
+#        },
+#    },
+
+    # starzeln:
+#     {
+#         "stream": "Starzeln",
+#         "injection": 1,
+#         "relative_submerge": 3.26,
+#         "params": {
+#             "VELOCITY_SCALE": 0.87,
+#             "D_SCALE": 1.0,
+#             "D_ZONE_FACTORS": np.array([0.7, 1.0, 0.3], dtype=float),
+#             "STORAGE_IN_SCALE": 1.0,
+#             "STORAGE_OUT_SCALE": 0.04,
+#        },
+#     },
+
+    # low-flow Leitschachbach:
+#     {
+#         "stream": "Leitschachbach",
+#         "injection": 2,
+#         "relative_submerge": 1.39,
+#         "params": {
+#             "VELOCITY_SCALE": 0.87,
+#             "D_SCALE": 1.0,
+#             "D_ZONE_FACTORS": np.array([0.7, 1.0, 0.3], dtype=float),
+#             "STORAGE_IN_SCALE": 1.0,
+#             "STORAGE_OUT_SCALE": 0.04,
+#         },
+#     },
+
+    # high-flow Leitschachbach:
+      {
+          "stream": "Leitschachbach",
+         "injection": 3,
+         "relative_submerge": 4.5,
+         "params": {
+             "VELOCITY_SCALE": 0.87,
+             "D_SCALE": 1.0,
+             "D_ZONE_FACTORS": np.array([0.7, 1.0, 0.3], dtype=float),
+             "STORAGE_IN_SCALE": 1.0,
+             "STORAGE_OUT_SCALE": 0.04,
+         },
+     },
+]
+
+# Numerical evaluation settings
+TAIL_EPS_FRACTION_OF_OBS_PEAK = 1e-6
+SHOW_PLOTS = True
+SAVE_EXCEL = False
+
+
+# =============================================================================
+# MODEL IMPORT / CONFIGURATION
+# =============================================================================
+
+
+# this function imports the model
+def load_model_module():
+    # checks if the model even exists and raises a error if this is the case
+    if not MODEL_SCRIPT.exists():
+        raise FileNotFoundError(f"Model script not found: {MODEL_SCRIPT}")
+
+    # creates a unique module name and prepares the import
+    module_name = f"btc_model_{time.time_ns()}"
+    spec = importlib.util.spec_from_file_location(module_name, MODEL_SCRIPT)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not import model from {MODEL_SCRIPT}")
+
+
+    # loads and executes the model module
+    model = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(model)
+    return model
+
+#this function applies the stream and injection specific settings to the imported model
+def configure_model(model, run):
+    model.STREAM = run["stream"]
+    model.INJECTION = int(run["injection"])
+    model.RELATIVE_SUBMERGE = float(run["relative_submerge"])
+
+    # sets the paths to the input data
+    model.MASTERFILE = MASTERFILE
+    model.BTC_FOLDER = BTC_FOLDER
+
+    # overrides model parameters with the values specified for this run.
+    for key, value in run.get("params", {}).items():
+        if not hasattr(model, key):
+            raise AttributeError(f"Model has no parameter named '{key}'")
+        setattr(model, key, value)
+
+    # recalculates state velocity factors after updating VELOCITY_SCALE.
+    model.VELOCITY_FACTORS = (
+        model.VELOCITY_SCALE * np.array([1.5, 1.0, 0.2], dtype=float)
+    )
+
+
+# =============================================================================
+# METRIC HELPERS
+# =============================================================================
+
+# this function calculculates when a certain tracer amount has passed the monitoring station
+def cumulative_area_quantile(t, y, q):
+    
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(t) < 2:
+        return np.nan
+
+    
+    # calculates the cumulative BTC area with the trapezoidal integration.
+    segment_area = 0.5 * (y[:-1] + y[1:]) * np.diff(t)
+    cumulative = np.r_[0.0, np.cumsum(segment_area)]
+
+    total = cumulative[-1]
+    if not np.isfinite(total) or total <= 0:
+        return np.nan
+    # interpolates the time corresponding to the specified area fraction.
+    return float(np.interp(q * total, cumulative, t))
+
+# this function creates a common time grid for the measured and simulated BTCs, allowing a direct comparison of both curves.
+def make_common_grid(model_t, obs_t, extra_times=None):
+
+    # converts both measurements into a numpy array
+    model_t = np.asarray(model_t, dtype=float)
+    obs_t = np.asarray(obs_t, dtype=float)
+
+    # selects model time points within the observed measurement windo
+    inside_model = model_t[
+        (model_t >= obs_t[0]) & (model_t <= obs_t[-1])
+    ]
+
+    # combines all time points and remove duplicates.
+    parts = [obs_t, inside_model]
+    # adds additional time points, such as the observed t90, to the common grid (if there is no data point at t90).
+    if extra_times is not None:
+        parts.append(np.atleast_1d(extra_times).astype(float))
+
+    return np.unique(np.concatenate(parts))
+
+
+
+# this function is the fundation for the two metrics "shape NRSME" and "tail RMSE"
+# it calculates the time-weighted RMSE between the model and measured data
+def time_weighted_rmse(a, b, t):
+    """
+    Continuous/time-weighted RMSE:
+        sqrt( integral((a-b)^2 dt) / duration )
+    """
+    if len(t) < 2:
+        return np.nan
+
+    # determines the duration of the evaluation window.
+    duration = t[-1] - t[0]
+    if duration <= 0:
+        return np.nan
+    
+    # integrates the squared differences over time and calculate the RMSE.
+    mse = np.trapezoid((a - b) ** 2, t) / duration
+    return float(np.sqrt(mse))
+
+
+# this function calculates the relevant metrics for the model performance
+# it calculates the five evaluation metrics of this thesis, namely
+# - Shape NRMSE
+# - Relative peak error
+# - Peak timing error
+# - tail RMSE
+# - Tail area error 
+
+# imporant notes
+# - Observed and model BTCs from the existing model are area-normalized
+# - Shape NRMSE additionally normalizes each BTC by its own maximum
+# - Tail RMSLE is calculated after scaling concentrations by a small observation-based epsilon. This makes the log transform dimensionless and avoids log(0), while retaining sensitivity to low tail concentrations
+def evaluate_metrics(model_t, model_pdf, obs_t, obs_pdf):
+
+   # converts time and BTC values into numpy arrays
+    model_t = np.asarray(model_t, dtype=float)
+    model_pdf = np.asarray(model_pdf, dtype=float)
+    obs_t = np.asarray(obs_t, dtype=float)
+    obs_pdf = np.asarray(obs_pdf, dtype=float)
+
+    if len(obs_t) < 2 or len(model_t) < 2:
+        raise ValueError("Both observed and model curves need at least 2 points.")
+
+    peak_obs = float(np.max(obs_pdf))
+    peak_model = float(np.max(model_pdf))
+
+    if peak_obs <= 0 or peak_model <= 0:
+        raise ValueError("Observed and model BTC must have a positive peak.")
+    
+    # determines the observed t90 and interpolate both BTCs onto a common time grid
+    t90_obs = cumulative_area_quantile(obs_t, obs_pdf, 0.90)
+    if not np.isfinite(t90_obs):
+        raise ValueError("Could not determine observed t90.")
+
+    grid = make_common_grid(model_t, obs_t, extra_times=[t90_obs])
+
+    obs = np.interp(grid, obs_t, obs_pdf, left=0.0, right=0.0)
+    sim = np.interp(grid, model_t, model_pdf, left=0.0, right=0.0)
+
+    # -------------------------------------------------------------------------
+    # 1) Shape NRMSE
+    # normalize both BTCs by their respective peak.
+    # -------------------------------------------------------------------------
+    # Normalize both BTCs by their respective peak.
+    obs_shape = obs / peak_obs
+    sim_shape = sim / peak_model
+
+    # Calculate the previous Shape NRMSE over the full observation window.
+    shape_nrmse_full_window = time_weighted_rmse(sim_shape, obs_shape, grid)
+
+    # Determine the signal window from the first to the last positive
+    # concentration of the observed BTC.
+    positive_observed_indices = np.flatnonzero(obs_pdf > 0.0)
+
+    if len(positive_observed_indices) < 2:
+        raise ValueError(
+            "Shape NRMSE needs at least two strictly positive observed BTC samples."
+        )
+
+    shape_start_s = float(obs_t[positive_observed_indices[0]])
+    shape_end_s = float(obs_t[positive_observed_indices[-1]])
+
+    if shape_end_s <= shape_start_s:
+        raise ValueError("Observed BTC has no positive-duration signal window.")
+
+    # Calculate Shape NRMSE only within the observed signal window.
+    shape_mask = (grid >= shape_start_s) & (grid <= shape_end_s)
+
+    shape_nrmse = time_weighted_rmse(
+        sim_shape[shape_mask],
+        obs_shape[shape_mask],
+        grid[shape_mask]
+)
+
+    # -------------------------------------------------------------------------
+    # 2) Relative peak concentration / height error
+    # positive = model peak too high
+    # negative = model peak too low
+    # -------------------------------------------------------------------------
+    peak_error_pct = 100.0 * (peak_model - peak_obs) / peak_obs
+
+    # -------------------------------------------------------------------------
+    # 3) Peak timing error
+    # Positive = model peak too late
+    # Negative = model peak too early
+    # -------------------------------------------------------------------------
+    obs_peak_time = float(obs_t[np.argmax(obs_pdf)])
+    model_peak_time = float(model_t[np.argmax(model_pdf)])
+    peak_timing_error_s = model_peak_time - obs_peak_time
+
+    # -------------------------------------------------------------------------
+    # Tail subset: t >= observed t90
+    # -------------------------------------------------------------------------
+    tail_mask = grid >= t90_obs
+    tail_t = grid[tail_mask]
+    obs_tail = obs[tail_mask]
+    sim_tail = sim[tail_mask]
+
+    if len(tail_t) < 2:
+        tail_rmsle = np.nan
+        obs_tail_area = np.nan
+        sim_tail_area = np.nan
+        tail_area_error_pct = np.nan
+    else:
+        # ---------------------------------------------------------------------
+        # 4) Tail RMSLE
+        #
+        # Curves are area-normalized and therefore small (1/s). Standard
+        # log1p(y) would almost equal y. We first scale by an epsilon based on
+        # the observed peak, then apply log1p:
+        #
+        #   log1p(C / epsilon)
+        #
+        # epsilon = 1e-6 * observed peak by default.
+        # ---------------------------------------------------------------------
+        eps = max(
+            TAIL_EPS_FRACTION_OF_OBS_PEAK * peak_obs,
+            np.finfo(float).tiny
+        )
+
+        log_obs = np.log1p(obs_tail / eps)
+        log_sim = np.log1p(sim_tail / eps)
+        tail_rmsle = time_weighted_rmse(log_sim, log_obs, tail_t)
+
+        # ---------------------------------------------------------------------
+        # 5) Relative tail area error
+        # Positive = model contains too much tail mass
+        # Negative = model contains too little tail mass
+        # ---------------------------------------------------------------------
+        obs_tail_area = float(np.trapezoid(obs_tail, tail_t))
+        sim_tail_area = float(np.trapezoid(sim_tail, tail_t))
+
+        if obs_tail_area > 0:
+            tail_area_error_pct = (
+                100.0 * (sim_tail_area - obs_tail_area) / obs_tail_area
+            )
+        else:
+            tail_area_error_pct = np.nan
+
+    # returns the five evaluation metrics and additional BTC characteristics.
+    return {
+        "Shape_NRMSE": shape_nrmse,
+        "Shape_NRMSE_full_window": shape_nrmse_full_window,
+        "Relative_peak_error_pct": float(peak_error_pct),
+        "Peak_timing_error_s": float(peak_timing_error_s),
+        "Tail_RMSLE": float(tail_rmsle),
+        "Relative_tail_area_error_pct": float(tail_area_error_pct),
+        "t90_observed_s": float(t90_obs),
+        "Observed_peak_time_s": obs_peak_time,
+        "Model_peak_time_s": model_peak_time,
+        "Observed_peak_height_1_s": peak_obs,
+        "Model_peak_height_1_s": peak_model,
+        "Observed_tail_area": float(obs_tail_area),
+        "Model_tail_area": float(sim_tail_area),
+    }
+
+
+# =============================================================================
+# PLOTTING HELPERS
+# =============================================================================
+
+# this function return cumulative BTC area fraction normalized from 0 to 1
+def cumulative_fraction(t, y):
+  
+    t = np.asarray(t, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if len(t) < 2:
+        return np.full_like(t, np.nan, dtype=float)
+
+    seg_area = 0.5 * (y[:-1] + y[1:]) * np.diff(t)
+    cum = np.r_[0.0, np.cumsum(seg_area)]
+    total = cum[-1]
+
+    if not np.isfinite(total) or total <= 0:
+        return np.full_like(t, np.nan, dtype=float)
+
+    return cum / total
+
+# this function normalizes a BTC by its own maximum (for plotting only)
+def normalize_by_peak(y):
+    
+    y = np.asarray(y, dtype=float)
+    peak = np.max(y) if len(y) else np.nan
+
+    if not np.isfinite(peak) or peak <= 0:
+        return y.copy()
+
+    return y / peak
+
+
+# This function determines the start and end of the BTC signal using a threshold of 0.5% of the normalized peak.
+def get_signal_window(t, y_norm, threshold=0.005):
+
+    t = np.asarray(t, dtype=float)
+    y_norm = np.asarray(y_norm, dtype=float)
+
+    mask = np.isfinite(y_norm) & (y_norm >= threshold)
+
+    if not np.any(mask):
+        return np.nan, np.nan
+
+    idx = np.where(mask)[0]
+    return float(t[idx[0]]), float(t[idx[-1]])
+
+# this function determines the visible BTC signal window for setting the plot's x-axis limits.
+def common_left_xlim(station_results, threshold=0.005):
+   
+    starts = []
+    ends = []
+
+    for item in station_results:
+        obs_t = np.asarray(item["obs_t"], dtype=float)
+        obs_y = np.asarray(item["obs_y"], dtype=float)
+        model_t = np.asarray(item["model_t"], dtype=float)
+        model_y = np.asarray(item["model_y"], dtype=float)
+
+        obs_norm = normalize_by_peak(obs_y)
+        model_norm = normalize_by_peak(model_y)
+
+        obs_start, obs_end = get_signal_window(obs_t, obs_norm, threshold=threshold)
+        model_start, model_end = get_signal_window(model_t, model_norm, threshold=threshold)
+
+        if np.isfinite(obs_start):
+            starts.append(obs_start)
+            ends.append(obs_end)
+
+        if np.isfinite(model_start):
+            starts.append(model_start)
+            ends.append(model_end)
+
+    if not starts:
+        return None
+
+    x0 = min(starts)
+    x1 = max(ends)
+    width = x1 - x0
+    pad = max(0.05 * width, 100.0)
+
+    return max(0.0, x0 - pad), x1 + pad
+
+# this function determines a common tail duration for all right-hand plots, based on the longest relevant observed tail after t90.
+def common_tail_duration(station_results, threshold=0.002):
+
+    durations = []
+
+    for item in station_results:
+        obs_t = np.asarray(item["obs_t"], dtype=float)
+        obs_y = np.asarray(item["obs_y"], dtype=float)
+        obs_norm = normalize_by_peak(obs_y)
+        t90 = float(item["metrics"]["t90_observed_s"])
+
+        mask = (
+            (obs_t >= t90)
+            & np.isfinite(obs_norm)
+            & (obs_norm >= threshold)
+        )
+
+        if np.any(mask):
+            last_tail_time = float(obs_t[np.where(mask)[0][-1]])
+            durations.append(last_tail_time - t90)
+
+    if not durations:
+        return 2000.0
+
+    return max(durations)
+
+
+# =============================================================================
+# PLOTTING
+# =============================================================================
+
+
+# this function visualizes the measured and simulated BTCs, including their cumulative fractions and tail behaviour.
+def plot_run(stream, injection, station_results, destination):
+    """
+    Plot observed and simulated BTCs.
+
+    Left column:
+        - BTC normalized by its own peak (peak = 1)
+        - cumulative tracer fraction on a secondary y-axis
+        - one common absolute x-range for all stations
+
+    Right column:
+        - declining limb / tail on logarithmic y-axis
+        - one common time window relative to observed t90
+    """
+    plt.rcParams.update({
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "legend.fontsize": 9,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+    })
+
+    n = len(station_results)
+
+    fig, axes = plt.subplots(
+        n,
+        2,
+        figsize=(12, max(4.0 * n, 6.0)),
+        squeeze=False,
+    )
+
+    # One common x-range for the full BTC plots.
+    left_xlim = common_left_xlim(station_results, threshold=0.005)
+
+    # One common tail duration after t90 for all stations.
+    tail_duration = common_tail_duration(station_results, threshold=0.002)
+    tail_before = max(0.05 * tail_duration, 100.0)
+    tail_after = 0.70 * tail_duration
+
+    for i, item in enumerate(station_results):
+        ax_full, ax_tail = axes[i]
+
+        obs_t = np.asarray(item["obs_t"], dtype=float)
+        obs_y = np.asarray(item["obs_y"], dtype=float)
+        model_t = np.asarray(item["model_t"], dtype=float)
+        model_y = np.asarray(item["model_y"], dtype=float)
+        t90 = float(item["metrics"]["t90_observed_s"])
+
+        station = item["station"]
+        distance = item["distance"]
+
+        # --------------------------------------------------------------
+        # Plot-only normalization
+        # --------------------------------------------------------------
+        obs_y_norm = normalize_by_peak(obs_y)
+        model_y_norm = normalize_by_peak(model_y)
+
+        # Cumulative fractions are calculated from the original
+        # area-normalized BTCs and then normalized to 1.
+        obs_cum = cumulative_fraction(obs_t, obs_y)
+        model_cum = cumulative_fraction(model_t, model_y)
+
+        # ==============================================================
+        # LEFT: normalized BTC + cumulative curves
+        # ==============================================================
+        ax_full.plot(
+            obs_t,
+            obs_y_norm,
+            lw=2.0,
+            label="Measured BTC",
+        )
+
+        ax_full.plot(
+            model_t,
+            model_y_norm,
+            "--",
+            lw=1.6,
+            label="Model BTC",
+        )
+
+        ax_full.axvline(
+            t90,
+            ls=":",
+            lw=1.0,
+            label="Observed t90",
+        )
+
+        ax_full.set_ylim(0.0, 1.05)
+        ax_full.set_ylabel("Normalized concentration [-]")
+        ax_full.set_xlabel("Time since injection [s]")
+        ax_full.grid(True, alpha=0.25)
+
+        if left_xlim is not None:
+            ax_full.set_xlim(left_xlim)
+
+        # Secondary y-axis for cumulative tracer fraction.
+        ax_full_cum = ax_full.twinx()
+
+        ax_full_cum.plot(
+            obs_t,
+            obs_cum,
+            ":",
+            lw=1.8,
+            label="Measured cumulative",
+        )
+
+        ax_full_cum.plot(
+            model_t,
+            model_cum,
+            "-.",
+            lw=1.6,
+            label="Model cumulative",
+        )
+
+        ax_full_cum.set_ylim(0.0, 1.05)
+        ax_full_cum.set_ylabel("Cumulative tracer fraction [-]")
+
+        # Combined legend, shifted downward to avoid overlapping the
+        # cumulative curves near y = 1.
+        h1, l1 = ax_full.get_legend_handles_labels()
+        h2, l2 = ax_full_cum.get_legend_handles_labels()
+
+        ax_full.legend(
+            h1 + h2,
+            l1 + l2,
+            frameon=False,
+            fontsize=9.0,
+            loc="upper right",
+            bbox_to_anchor=(0.98, 0.70)
+        )
+
+        # ==============================================================
+        # RIGHT: tail / declining limb in log scale
+        # ==============================================================
+        obs_tail_plot = np.where(obs_y_norm > 0, obs_y_norm, np.nan)
+        model_tail_plot = np.where(model_y_norm > 0, model_y_norm, np.nan)
+
+        ax_tail.plot(
+            obs_t,
+            obs_tail_plot,
+            lw=2.0,
+            label="Measured BTC",
+        )
+
+        ax_tail.plot(
+            model_t,
+            model_tail_plot,
+            "--",
+            lw=1.6,
+            label="Model BTC",
+        )
+
+        ax_tail.axvline(
+            t90,
+            ls=":",
+            lw=1.0,
+            label="Observed t90",
+        )
+
+        ax_tail.set_yscale("log")
+        ax_tail.set_ylabel("Normalized concentration [-]")
+        ax_tail.set_xlabel("Time since injection [s]")
+        ax_tail.grid(True, which="major", alpha=0.25)
+
+        # Same tail-window duration for every station, relative to t90.
+        ax_tail.set_xlim(
+            max(0.0, t90 - tail_before),
+            t90 + tail_after,
+        )
+
+        # Sensible common-style lower y-limit without forcing values below
+        # the useful signal range to dominate the plot.
+        positive_vals = np.r_[
+            obs_tail_plot[np.isfinite(obs_tail_plot)],
+            model_tail_plot[np.isfinite(model_tail_plot)],
+        ]
+
+        if len(positive_vals) > 0:
+            ymin = max(np.nanmin(positive_vals) * 0.8, 1e-4)
+            ax_tail.set_ylim(ymin, 1.2)
+
+        ax_tail.legend(
+            frameon=False,
+            fontsize=9,
+            loc="upper right",
+        )
+
+        title = f"{station}, {distance:.0f} m"
+        ax_full.set_title(title)
+        ax_tail.set_title(title + " — tail")
+
+    fig.suptitle(
+        f"{stream}, injection {injection}: measured vs simulated BTCs",
+        y=0.995,
+    )
+
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+
+    stem = f"{stream}_injection_{injection}_model_evaluation"
+
+    # saves the BTC comparison plots in PNG and PDF format.
+    fig.savefig(
+        destination / f"{stem}.png",
+        dpi=300,
+        bbox_inches="tight",
+    )
+
+    fig.savefig(
+        destination / f"{stem}.pdf",
+        bbox_inches="tight",
+    )
+
+    return fig
+
+
+# =============================================================================
+# ONE MODEL RUN
+# =============================================================================
+
+def evaluate_run(run):
+    model = load_model_module()
+    configure_model(model, run)
+
+    stream = model.STREAM
+    injection = model.INJECTION
+
+    destination = OUTPUT_ROOT / f"{stream}_injection_{injection}"
+    destination.mkdir(parents=True, exist_ok=True)
+
+    print("\n" + "=" * 90)
+    print(f"RUNNING: {stream}, injection {injection}")
+    print("=" * 90)
+
+    # -------------------------------------------------------------------------
+    # Read model inputs and derive empirical dispersion / sectional velocities.
+    # These are the same steps used in the existing model.
+    # -------------------------------------------------------------------------
+    master_rows = model.load_master_rows()
+    master_rows = model.estimate_empirical_dispersion(master_rows)
+
+    dispersion_trend = model.estimate_dispersion_distance_trend(master_rows)
+    section_table, u_section_zones = model.calculate_section_velocities(master_rows)
+
+    distances = master_rows["Distance_m"].to_numpy(dtype=float, copy=True)
+
+    # -------------------------------------------------------------------------
+    # Run particle model once for all stations.
+    # -------------------------------------------------------------------------
+    arrival_times = model.run_model(
+        distances,
+        u_section_zones,
+        dispersion_trend,
+    )
+
+    metric_rows = []
+    station_results = []
+    observed_curve_tables = []
+    model_curve_tables = []
+
+    # -------------------------------------------------------------------------
+    # Evaluate each station.
+    # -------------------------------------------------------------------------
+    for _, row in master_rows.iterrows():
+        station = str(row["Monitoring_station"])
+        device = int(row["Device_number"])
+        distance = float(row["Distance_m"])
+
+        obs_t, obs_pdf = model.load_measured_btc(
+            model.find_btc_file(device),
+            row["Injection_time_UTC"],
+        )
+
+        arrivals = arrival_times[distance]
+        if len(arrivals) == 0:
+            raise RuntimeError(
+                f"No model particles reached {station} ({distance} m)."
+            )
+
+        model_t, model_pdf = model.model_pdf_from_arrivals(arrivals)
+
+        metrics = evaluate_metrics(
+            model_t,
+            model_pdf,
+            obs_t,
+            obs_pdf,
+        )
+
+        arrived_fraction = len(arrivals) / model.N_PARTICLES
+
+        metric_rows.append({
+            "Stream": stream,
+            "Injection": injection,
+            "Monitoring_station": station,
+            "Device_number": device,
+            "Distance_m": distance,
+            
+            "Relative_submergence": model.RELATIVE_SUBMERGE,
+            "Velocity_scale": model.VELOCITY_SCALE,
+            "D_scale": model.D_SCALE,
+            "D_fast_factor": float(model.D_ZONE_FACTORS[0]),
+            "D_intermediate_factor": float(model.D_ZONE_FACTORS[1]),
+            "D_storage_factor": float(model.D_ZONE_FACTORS[2]),
+            "Storage_in_scale": model.STORAGE_IN_SCALE,
+            "Storage_out_scale": model.STORAGE_OUT_SCALE,
+
+            "Effective_k_intermediate_to_storage_1_s":
+                float(model.exchange_matrix(model.RELATIVE_SUBMERGE)[1, 2]),
+            "Effective_k_storage_to_intermediate_1_s":
+                float(model.exchange_matrix(model.RELATIVE_SUBMERGE)[2, 1]),
+
+            "Arrived_fraction_by_TMAX": arrived_fraction,
+
+            **metrics,
+        })
+
+        station_results.append({
+            "station": station,
+            "distance": distance,
+            "obs_t": obs_t,
+            "obs_y": obs_pdf,
+            "model_t": model_t,
+            "model_y": model_pdf,
+            "metrics": metrics,
+        })
+
+        observed_curve_tables.append(pd.DataFrame({
+            "Stream": stream,
+            "Injection": injection,
+            "Monitoring_station": station,
+            "Distance_m": distance,
+            "time_s": obs_t,
+            "observed_area_normalized_1_s": obs_pdf,
+        }))
+
+        model_curve_tables.append(pd.DataFrame({
+            "Stream": stream,
+            "Injection": injection,
+            "Monitoring_station": station,
+            "Distance_m": distance,
+            "time_s": model_t,
+            "model_area_normalized_1_s": model_pdf,
+        }))
+
+        print(
+            f"{station:>6s} | {distance:7.1f} m | "
+            f"Shape NRMSE={metrics['Shape_NRMSE']:.4f} | "
+            f"Peak err={metrics['Relative_peak_error_pct']:+7.2f}% | "
+            f"Peak dt={metrics['Peak_timing_error_s']:+8.1f}s | "
+            f"Tail RMSLE={metrics['Tail_RMSLE']:.4f} | "
+            f"Tail area err={metrics['Relative_tail_area_error_pct']:+7.2f}%"
+        )
+
+    metrics_df = pd.DataFrame(metric_rows)
+
+    # -------------------------------------------------------------------------
+    # Overall summary across stations.
+    # Absolute signed errors are used for the summary so over- and
+    # underprediction do not cancel.
+    # -------------------------------------------------------------------------
+    summary = pd.DataFrame([{
+        "Stream": stream,
+        "Injection": injection,
+        "N_stations": len(metrics_df),
+        "Mean_shape_NRMSE": metrics_df["Shape_NRMSE"].mean(),
+        "Mean_shape_NRMSE_full_window":
+            metrics_df["Shape_NRMSE_full_window"].mean(),
+        "Mean_abs_relative_peak_error_pct":
+            metrics_df["Relative_peak_error_pct"].abs().mean(),
+        "Mean_abs_peak_timing_error_s":
+            metrics_df["Peak_timing_error_s"].abs().mean(),
+        "Mean_tail_RMSLE": metrics_df["Tail_RMSLE"].mean(),
+        "Mean_abs_relative_tail_area_error_pct":
+            metrics_df["Relative_tail_area_error_pct"].abs().mean(),
+        "Minimum_arrived_fraction":
+            metrics_df["Arrived_fraction_by_TMAX"].min(),
+    }])
+
+    # -------------------------------------------------------------------------
+    # Save outputs.
+    # -------------------------------------------------------------------------
+    metrics_df.to_csv(destination / "metrics_by_station.csv", index=False)
+    summary.to_csv(destination / "metrics_summary.csv", index=False)
+
+    pd.concat(observed_curve_tables, ignore_index=True).to_csv(
+        destination / "observed_curves.csv",
+        index=False,
+    )
+
+    pd.concat(model_curve_tables, ignore_index=True).to_csv(
+        destination / "model_curves.csv",
+        index=False,
+    )
+
+    section_table.to_csv(
+        destination / "section_velocities.csv",
+        index=False,
+    )
+
+    dispersion_trend["diagnostics"].to_csv(
+        destination / "dispersion_trend.csv",
+        index=False,
+    )
+
+    if SAVE_EXCEL:
+        with pd.ExcelWriter(
+            destination / "model_evaluation.xlsx",
+            engine="openpyxl",
+        ) as writer:
+            metrics_df.to_excel(
+                writer,
+                sheet_name="metrics_by_station",
+                index=False,
+            )
+            summary.to_excel(
+                writer,
+                sheet_name="summary",
+                index=False,
+            )
+            section_table.to_excel(
+                writer,
+                sheet_name="section_velocities",
+                index=False,
+            )
+            dispersion_trend["diagnostics"].to_excel(
+                writer,
+                sheet_name="dispersion_trend",
+                index=False,
+            )
+
+    settings = {
+        "stream": stream,
+        "injection": injection,
+        "relative_submergence": float(model.RELATIVE_SUBMERGE),
+        "velocity_scale": float(model.VELOCITY_SCALE),
+        "velocity_factors": np.asarray(model.VELOCITY_FACTORS).tolist(),
+        "D_scale": float(model.D_SCALE),
+        "D_zone_factors": np.asarray(model.D_ZONE_FACTORS).tolist(),
+        "storage_in_scale": float(model.STORAGE_IN_SCALE),
+        "storage_out_scale": float(model.STORAGE_OUT_SCALE),
+        "N_particles": int(model.N_PARTICLES),
+        "dt_s": float(model.DT),
+        "T_max_s": float(model.T_MAX),
+        "bin_width_s": float(model.BIN_WIDTH),
+        "random_seed": int(model.RANDOM_SEED),
+        "tail_start_definition": "observed t90",
+        "tail_rmsle_epsilon_fraction_of_observed_peak":
+            TAIL_EPS_FRACTION_OF_OBS_PEAK,
+        "shape_metric":
+            "time-weighted RMSE after separate peak-normalization, "
+            "calculated from the first to the last positive observed BTC sample, "
+            "including internal zeros",
+        "shape_metric_full_window_reference":
+            "previous time-weighted RMSE across the entire observed time range",
+                "signed_error_convention":
+                    "positive = model higher/later/more tail area; negative = lower/earlier/less tail area",
+    }
+
+    (destination / "settings.json").write_text(
+        json.dumps(settings, indent=2),
+        encoding="utf-8",
+    )
+
+    fig = plot_run(
+        stream,
+        injection,
+        station_results,
+        destination,
+    )
+
+    print("\nSummary:")
+    print(summary.to_string(index=False))
+    print(f"\nSaved to: {destination.resolve()}")
+
+    if SHOW_PLOTS:
+        plt.show()
+    else:
+        plt.close(fig)
+
+    return metrics_df, summary
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main():
+    """
+    Execute all configured model runs, combine their evaluation
+    metrics, and save the results.
+    """
+    if not MASTERFILE.exists():
+        raise FileNotFoundError(
+            f"Mastertable not found: {MASTERFILE}\n"
+            "Place this script beside BTC_mastertable.xlsx."
+        )
+
+    if not BTC_FOLDER.exists():
+        raise FileNotFoundError(
+            f"BTC folder not found: {BTC_FOLDER}\n"
+            "Place this script beside btc_background_corrected/."
+        )
+
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+
+    all_metrics = []
+    all_summaries = []
+
+    for run in RUNS:
+        metrics, summary = evaluate_run(run)
+        all_metrics.append(metrics)
+        all_summaries.append(summary)
+
+    combined_metrics = pd.concat(all_metrics, ignore_index=True)
+    combined_summary = pd.concat(all_summaries, ignore_index=True)
+
+    combined_metrics.to_csv(
+        OUTPUT_ROOT / "ALL_model_metrics_by_station.csv",
+        index=False,
+    )
+    combined_summary.to_csv(
+        OUTPUT_ROOT / "ALL_model_metrics_summary.csv",
+        index=False,
+    )
+
+    if SAVE_EXCEL:
+        with pd.ExcelWriter(
+            OUTPUT_ROOT / "ALL_model_evaluation.xlsx",
+            engine="openpyxl",
+        ) as writer:
+            combined_metrics.to_excel(
+                writer,
+                sheet_name="metrics_by_station",
+                index=False,
+            )
+            combined_summary.to_excel(
+                writer,
+                sheet_name="summary",
+                index=False,
+            )
+
+    print("\n" + "=" * 90)
+    print("ALL RUNS COMPLETED")
+    print("=" * 90)
+    print(combined_summary.to_string(index=False))
+    print(f"\nCombined results saved in: {OUTPUT_ROOT.resolve()}")
+
+# executes the main function when the script is run directly
+if __name__ == "__main__":
+    main()
