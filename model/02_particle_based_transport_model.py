@@ -10,7 +10,7 @@ STREAM = "Gangbach"
 INJECTION = 2
 
 # path to the data derived from the measurements (mastertable)
-MASTERFILE = Path("BTC_mastertable_corrected_simple.csv")
+MASTERFILE = Path("BTC_mastertable.csv")
 
 # path to the BTCs (corrected)
 BTC_FOLDER = Path("btc_background_corrected")
