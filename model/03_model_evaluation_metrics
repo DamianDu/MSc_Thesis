@@ -40,10 +40,10 @@ import matplotlib.pyplot as plt
 BASE_DIR = Path(__file__).resolve().parent
 
 # Existing model script
-MODEL_SCRIPT = BASE_DIR / "13_model_new_corrected.py"
+MODEL_SCRIPT = BASE_DIR / "02_particle_based_transport_model.py"
 
 # Mastertable generated for the evaluation of the measured BTCs
-MASTERFILE = Path.home() / "BTC_output" / "BTC_mastertable_simple.csv"
+MASTERFILE = Path.home() / "BTC_output" / "BTC_mastertable.csv"
 
 # Cleaned BTC input files
 BTC_FOLDER = BASE_DIR / "btc_background_corrected"
