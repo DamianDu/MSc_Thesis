@@ -28,10 +28,10 @@ INPUT_DIR = BASE_DIR / "btc_background_corrected"
 OUTPUT_DIR = Path.home() / "BTC_output"
 
 # output stored as a .csv for further analysis steps
-OUTPUT_CSV = OUTPUT_DIR / "BTC_mastertable_simple.csv"
+OUTPUT_CSV = OUTPUT_DIR / "BTC_mastertable.csv"
 
 # output stored as a .xlsx for a better overview
-OUTPUT_XLSX = OUTPUT_DIR / "BTC_mastertable_simple.xlsx"
+OUTPUT_XLSX = OUTPUT_DIR / "BTC_mastertable.xlsx"
 
 
 # definition of the uncalibrated fluorometer-values
