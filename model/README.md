@@ -3,7 +3,7 @@ all the important files and scripts are in this folder. It is important to follo
 The following order has to be fulfulled for a satisfy results.
 - 01_create_mastertable.py
 - 02_particle_based_transport_model.py
-- 03_model_and_metrics.py
+- 03_model_evaluation_metrics.py
 
 01_create_mastertable.py
 This file loads in the cleaned data from the tracer experiments and calculates the metrics that will be used by the model and have been analyzed in the first part of the thesis.
